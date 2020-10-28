@@ -22,7 +22,12 @@ import '_callback_io.dart' if (dart.library.html) '_callback_web.dart'
 import 'src/constants.dart';
 import 'src/reporter.dart';
 
-bool _isUsingLegacyReporting = true;
+/// Toggle the legacy reporting mechansim where results are only collected
+/// through [testWidgets].
+///
+/// This method is deprecated and purely to facilite migrations, do not use.
+@Deprecated('For incremental migration to the new reporter, do not use.')
+bool isUsingLegacyReporting = true;
 
 /// Executes a block that contains tests.
 ///
@@ -43,14 +48,15 @@ bool _isUsingLegacyReporting = true;
 /// The returned future will complete with the test results of the running
 /// [testMain]. These results will also be sent to native over the platform
 /// channel, unless [reportResultsToNative] is set to false.
-// TODO(jiahaog): Have stronger types for the returned success / failure result.
-Future<Map<String, Object>> run(FutureOr<void> Function() testMain,
-    {bool reportResultsToNative = true}) async {
-  assert(WidgetsBinding.instance == null);
-
-  _isUsingLegacyReporting = false;
+Future<void> run(
+  FutureOr<void> Function() testMain, {
+  Reporter reporter = const _ReporterImpl(),
+}) async {
+  // ignore: deprecated_member_use_from_same_package
+  isUsingLegacyReporting = false;
   final IntegrationTestWidgetsFlutterBinding binding =
-      IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+      IntegrationTestWidgetsFlutterBinding.ensureInitialized()
+          as IntegrationTestWidgetsFlutterBinding;
 
   // Pipe detailed exceptions within [testWidgets] to `package:test`.
   reportTestException = (FlutterErrorDetails details, String testDescription) {
@@ -67,42 +73,49 @@ Future<Map<String, Object>> run(FutureOr<void> Function() testMain,
 
   final Map<String, Object> results = await resultsCompleter.future;
 
-  if (reportResultsToNative) {
-    await _reportResultsToNative(binding, results);
+  binding._updateTestResultState(results);
+  await reporter.report(results);
+}
+
+/// Abstract interface for a result reporter.
+abstract class Reporter {
+  /// Reports test results.
+  ///
+  /// This method will be called at the end of [run] with the [results] of
+  /// running the test suite.
+  // TODO(jiahaog): Have stronger types for the returned success / failure result.
+  Future<void> report(Map<String, Object> results);
+}
+
+/// Default implementation of the reporter that sends results over to the
+/// platform side.
+class _ReporterImpl implements Reporter {
+  const _ReporterImpl();
+
+  @override
+  Future<void> report(
+    Map<String, Object> results,
+  ) async {
+    try {
+      await IntegrationTestWidgetsFlutterBinding._channel.invokeMethod<void>(
+        'allTestsFinished',
+        <String, dynamic>{
+          'results': {
+            for (final result in results.entries)
+              result.key: result.value is Failure
+                  ? _formatFailureForPlatform(result.value)
+                  : result.value
+          }
+        },
+      );
+    } on MissingPluginException {
+      print('Warning: integration_test test plugin was not detected.');
+    }
   }
-  return results;
 }
 
 String _formatFailureForPlatform(Failure failure) =>
     '${failure.error} ${failure.details}';
-
-Future<void> _reportResultsToNative(
-  IntegrationTestWidgetsFlutterBinding binding,
-  Map<String, Object> results,
-) async {
-  binding.results = results;
-  print('Test execution completed: ${binding.results}');
-
-  binding._allTestsPassed
-      .complete(!binding.results.values.any((val) => val is Failure));
-
-  try {
-    binding.callbackManager.cleanup();
-    await IntegrationTestWidgetsFlutterBinding._channel.invokeMethod<void>(
-      'allTestsFinished',
-      <String, dynamic>{
-        'results': {
-          for (final result in binding.results.entries)
-            result.key: result.value is Failure
-                ? _formatFailureForPlatform(result.value)
-                : result.value
-        }
-      },
-    );
-  } on MissingPluginException {
-    print('Warning: integration_test test plugin was not detected.');
-  }
-}
 
 /// A subclass of [LiveTestWidgetsFlutterBinding] that reports tests results
 /// on a channel to adapt them to native instrumentation test format.
@@ -114,7 +127,8 @@ class IntegrationTestWidgetsFlutterBinding extends LiveTestWidgetsFlutterBinding
   /// This functionality is deprecated – clients are expected to use [run] to
   /// execute their tests instead.
   IntegrationTestWidgetsFlutterBinding() {
-    if (!_isUsingLegacyReporting) {
+    // ignore: deprecated_member_use_from_same_package
+    if (!isUsingLegacyReporting) {
       // TODO(flutter/flutter#66264): Point users to use the CLI.
       print('Using the legacy test result reporter, which will not catch all '
           'errors thrown in declared tests. Consider wrapping tests with [run] '
@@ -122,7 +136,10 @@ class IntegrationTestWidgetsFlutterBinding extends LiveTestWidgetsFlutterBinding
       return;
     }
 
-    tearDownAll(() => _reportResultsToNative(this, results));
+    tearDownAll(() async {
+      _updateTestResultState(results);
+      await _ReporterImpl().report(results);
+    });
 
     final TestExceptionReporter oldTestExceptionReporter = reportTestException;
     reportTestException =
@@ -131,6 +148,14 @@ class IntegrationTestWidgetsFlutterBinding extends LiveTestWidgetsFlutterBinding
           error: details.exception);
       oldTestExceptionReporter(details, testDescription);
     };
+  }
+
+  void _updateTestResultState(Map<String, Object> results) {
+    this.results = results;
+    print('Test execution completed: ${results}');
+
+    _allTestsPassed.complete(!results.values.any((val) => val is Failure));
+    callbackManager.cleanup();
   }
 
   // TODO(dnfield): Remove the ignore once we bump the minimum Flutter version
